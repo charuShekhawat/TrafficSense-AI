@@ -2,6 +2,10 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const fs = require('node:fs');
+const { execFile } = require('node:child_process');
+const os = require('node:os');
+const path = require('node:path');
 
 const app = express();
 app.use(cors());
@@ -22,11 +26,13 @@ let systemState = {
   mode: 'AI', // 'AI' or 'STATIC'
   weather: 'Clear', // 'Clear' or 'Rain'
   emergency: false,
+  events: [],
+  control: null,
   lanes: {
-    north: { vehicles: 0, signal: 'RED', time: 0, boxes: [], ambulanceBoxes: [] },
-    east:  { vehicles: 0, signal: 'RED', time: 0, boxes: [], ambulanceBoxes: [] },
-    south: { vehicles: 0, signal: 'RED', time: 0, boxes: [], ambulanceBoxes: [] },
-    west:  { vehicles: 0, signal: 'RED', time: 0, boxes: [], ambulanceBoxes: [] }
+    north: { vehicles: 0, ambulance: false, signal: 'RED', time: 0, boxes: [], ambulanceBoxes: [] },
+    east:  { vehicles: 0, ambulance: false, signal: 'RED', time: 0, boxes: [], ambulanceBoxes: [] },
+    south: { vehicles: 0, ambulance: false, signal: 'RED', time: 0, boxes: [], ambulanceBoxes: [] },
+    west:  { vehicles: 0, ambulance: false, signal: 'RED', time: 0, boxes: [], ambulanceBoxes: [] }
   }
 };
 
@@ -40,7 +46,6 @@ let engine = {
   laneIdleTimer: { north: 0, east: 0, south: 0, west: 0 },
   ambulanceQueue: [],
   ambulanceActiveLane: null,
-  ambulanceCapTimer: 0,
   pendingAmbulanceLane: null, // Lane waiting for GREEN after yellow transition
   prevVehicles: { north: 0, east: 0, south: 0, west: 0 },
   lastPingTime: Date.now()
@@ -55,8 +60,44 @@ let detections = {
   weather: 'Clear'
 };
 
+const reportDirectory = path.join(process.env.LOCALAPPDATA || os.homedir(), 'TrafficSenseAi');
+const reportHistory = path.join(reportDirectory, 'signal-decisions.jsonl');
+const sessionStarted = new Date().toISOString();
+let eventSequence = 0;
+let reportError = false;
+const laneName = lane => lane.charAt(0).toUpperCase() + lane.slice(1);
+function recordDecision(category, message) {
+  const event = { id: ++eventSequence, timestamp: Date.now(), category, message };
+  systemState.events.unshift(event);
+  systemState.events = systemState.events.slice(0, 20);
+  const entry = {
+    ...event, sessionStarted, mode: systemState.mode, weather: systemState.weather,
+    activeLane: engine.phase === 'ALL_RED' ? '' : engine.activeLane,
+    phase: engine.phase, remainingSeconds: engine.timer,
+    vehicles: Object.fromEntries(LANES.map(lane => [lane, detections[lane].vehicles])),
+  };
+  try {
+    fs.mkdirSync(reportDirectory, { recursive: true });
+    fs.appendFileSync(reportHistory, JSON.stringify(entry) + '\n', 'utf8');
+  } catch (error) {
+    reportError = true;
+    console.error('Could not save signal decision:', error.message);
+  }
+}
+
+function recordSignalChange(previousLane, previousPhase) {
+  if (previousLane === engine.activeLane && previousPhase === engine.phase) return;
+  const signal = engine.phase === 'ALL_RED'
+    ? 'All lanes are RED'
+    : `${laneName(engine.activeLane)} is ${engine.phase}; all other lanes are RED`;
+  recordDecision('SIGNAL', `${signal}.`);
+}
+
+recordDecision('SYSTEM', 'Controller started. Waiting for live traffic detections.');
+
 // Start logic loop (1 second tick)
 setInterval(() => {
+  const { activeLane, phase } = engine;
   // Sync weather from detections
   systemState.weather = detections.weather || 'Clear';
 
@@ -65,6 +106,8 @@ setInterval(() => {
   } else {
     handleAiMode();
   }
+
+  recordSignalChange(activeLane, phase);
 
   // Map internal engine data to external state
   updateExternalState();
@@ -76,11 +119,19 @@ setInterval(() => {
     west: systemState.lanes.west,
     weather: systemState.weather,
     mode: systemState.mode,
-    emergency: systemState.emergency
+    emergency: systemState.emergency,
+    control: systemState.control,
+    events: systemState.events
   });
 }, 1000);
 
 function handleStaticMode() {
+  if (engine.timer === null) {
+    engine.timer = 30;
+    systemState.emergency = false;
+    engine.ambulanceActiveLane = null;
+    engine.pendingAmbulanceLane = null;
+  }
   // Graceful recovery from AI crash states
   if (engine.phase === 'ALL_RED') {
     engine.phase = 'GREEN';
@@ -106,7 +157,9 @@ function handleAiMode() {
   // SENSOR FAILURE CHECK
   if (Date.now() - engine.lastPingTime > 10000) {
      console.log("Sensor failure detected (10s no ping). Switching to STATIC mode.");
+
      systemState.mode = 'STATIC';
+     recordDecision('SYSTEM', 'Detection updates have stopped. Switching to fixed-time STATIC control.');
      return handleStaticMode();
   }
 
@@ -137,6 +190,10 @@ function handleAiMode() {
   }
 
   // ─── HANDLE PENDING AMBULANCE (waiting for yellow to finish) ───
+  if (engine.pendingAmbulanceLane && !detections[engine.pendingAmbulanceLane].ambulance) {
+    recordDecision('AMBULANCE', `${laneName(engine.pendingAmbulanceLane)} ambulance detection changed to NO before priority started. Completing the current YELLOW transition and returning to normal scheduling.`);
+    engine.pendingAmbulanceLane = null;
+  }
   if (engine.pendingAmbulanceLane) {
     engine.timer--;
     if (engine.timer <= 0) {
@@ -146,8 +203,8 @@ function handleAiMode() {
       engine.pendingAmbulanceLane = null;
       systemState.emergency = true;
       engine.phase = 'GREEN';
-      engine.timer = 99;
-      engine.ambulanceCapTimer = 0;
+      engine.timer = null; // Detection-controlled GREEN; no countdown.
+      recordDecision('AMBULANCE', `${laneName(engine.activeLane)} is now GREEN for ambulance priority. All other lanes are RED.`);
       console.log(`🚑 Ambulance GREEN activated for ${engine.activeLane}`);
     }
     return;
@@ -155,14 +212,13 @@ function handleAiMode() {
 
   // ─── CHECK IF CURRENT EMERGENCY LANE LOST AMBULANCE ───
   if (systemState.emergency) {
-    engine.ambulanceCapTimer++;
-    if (engine.ambulanceHistory[engine.ambulanceActiveLane] >= 3 || engine.ambulanceCapTimer >= 60) {
+    if (!detections[engine.ambulanceActiveLane].ambulance) {
       // Emergency over → go YELLOW 3s, then restart round-robin from ambulance lane
+      recordDecision('AMBULANCE', `${laneName(engine.activeLane)} ambulance priority ended: ambulance detection changed to NO. This lane changes to YELLOW for 3 seconds, then normal scheduling resumes.`);
       systemState.emergency = false;
       // activeLane stays as ambulanceActiveLane so round-robin continues from here
       engine.activeLane = engine.ambulanceActiveLane;
       engine.ambulanceActiveLane = null;
-      engine.ambulanceCapTimer = 0;
       engine.phase = 'YELLOW';
       engine.timer = 3;
       console.log(`🚑 Emergency ended. Yellow transition from ${engine.activeLane}, round-robin resumes after.`);
@@ -171,7 +227,7 @@ function handleAiMode() {
       // Emergency still active — keep ambulance lane GREEN
       engine.phase = 'GREEN';
       engine.activeLane = engine.ambulanceActiveLane;
-      engine.timer = 99;
+      engine.timer = null; // Detection-controlled GREEN; no countdown.
       return; 
     }
   }
@@ -183,16 +239,17 @@ function handleAiMode() {
 
     // If ambulance is already in the current green lane, just activate emergency directly
     if (targetAmbulance === engine.activeLane && engine.phase === 'GREEN') {
+      recordDecision('AMBULANCE', `Ambulance confirmed in ${laneName(targetAmbulance)}. This lane is already GREEN; priority is maintained and all other lanes remain RED.`);
       systemState.emergency = true;
       engine.ambulanceActiveLane = targetAmbulance;
       engine.phase = 'GREEN';
-      engine.timer = 99;
-      engine.ambulanceCapTimer = 0;
+      engine.timer = null; // Detection-controlled GREEN; no countdown.
       console.log(`🚑 Ambulance detected in current GREEN lane: ${targetAmbulance}`);
       return;
     }
 
     // Ambulance in a different lane → current lane goes YELLOW(3s) first
+    recordDecision('AMBULANCE', `Ambulance confirmed in ${laneName(targetAmbulance)}. ${laneName(engine.activeLane)} changes to YELLOW for 3 seconds, then RED. ${laneName(targetAmbulance)} will receive GREEN priority.`);
     engine.pendingAmbulanceLane = targetAmbulance;
     engine.phase = 'YELLOW';
     engine.timer = 3;
@@ -208,6 +265,7 @@ function handleAiMode() {
      let currentDiff = detections[engine.activeLane].vehicles - engine.prevVehicles[engine.activeLane];
      if (currentDiff >= 5 && engine.timer < 10) {
         engine.timer += 5;
+        recordDecision('DENSITY', `${laneName(engine.activeLane)} traffic increased by ${currentDiff} vehicles to ${detections[engine.activeLane].vehicles}. GREEN extended by 5 seconds.`);
         console.log(`Traffic Spike Detected in ${engine.activeLane}, adding 5 secs.`);
      }
   }
@@ -220,17 +278,17 @@ function handleAiMode() {
     } else if (engine.phase === 'YELLOW') {
       // YELLOW expired → pick next lane
       let nextLane = null;
+      let selectionReason = 'normal rotation, skipping empty lanes';
       
-      // Starvation Priority Override
-      for (let l of LANES) {
-          if (engine.laneIdleTimer[l] >= 30) {
-              nextLane = l;
-              engine.laneIdleTimer[l] = 0;
-              console.log(`Lane Starvation Triggered: Forcing ${l} to GREEN`);
-              break;
-          }
+      // At phase boundaries, serve the longest-waiting occupied lane first.
+      const overdue = LANES.filter(l => detections[l].vehicles > 0 && engine.laneIdleTimer[l] >= 30);
+      overdue.sort((a, b) => engine.laneIdleTimer[b] - engine.laneIdleTimer[a]);
+      if (overdue.length) {
+        nextLane = overdue[0];
+        selectionReason = `waiting-time priority: lane has waited ${engine.laneIdleTimer[nextLane]} seconds`;
+        engine.laneIdleTimer[nextLane] = 0;
       }
-      
+
       if (!nextLane) {
           nextLane = getNextLane(engine.activeLane);
           let attempts = 0;
@@ -241,6 +299,7 @@ function handleAiMode() {
           }
 
           if (attempts === 4) {
+            recordDecision('DENSITY', 'No vehicles detected in any lane. All signals are RED; checking for arrivals.');
             engine.phase = 'ALL_RED';
             engine.timer = 2;
             return;
@@ -249,17 +308,17 @@ function handleAiMode() {
 
       engine.activeLane = nextLane;
       engine.phase = 'GREEN';
-      let baseTime = 15;
-      if (systemState.weather === 'Rain') baseTime += 10;
+      const baseTime = getGreenDuration(nextLane);
       engine.timer = baseTime;
+      recordDecision('DENSITY', `${laneName(nextLane)} receives ${baseTime} seconds of GREEN with ${detections[nextLane].vehicles} detected vehicles: ${selectionReason}${systemState.weather === 'Rain' ? '; rain allowance included within the 45-second allocation cap' : ''}.`);
     } else if (engine.phase === 'ALL_RED') {
       let foundLane = LANES.find(l => detections[l].vehicles > 0);
       if (foundLane) {
         engine.activeLane = foundLane;
         engine.phase = 'GREEN';
-        let baseTime = 15;
-        if (systemState.weather === 'Rain') baseTime += 10;
+        const baseTime = getGreenDuration(foundLane);
         engine.timer = baseTime;
+        recordDecision('DENSITY', `${laneName(foundLane)} has ${detections[foundLane].vehicles} detected vehicles. Leaving all-RED and assigning ${baseTime} seconds of GREEN.`);
       } else {
         engine.timer = 2;
       }
@@ -272,15 +331,42 @@ function handleAiMode() {
   }
 }
 
+function getGreenDuration(lane) {
+  const count = Math.max(0, Number(detections[lane].vehicles) || 0);
+  const weatherExtra = systemState.weather === 'Rain' ? 10 : 0;
+  return Math.min(45, Math.max(10, 10 + Math.ceil(count) * 2 + weatherExtra));
+}
+
 function getNextLane(current) {
   let idx = LANES.indexOf(current);
   return LANES[(idx + 1) % LANES.length];
 }
 
 function updateExternalState() {
+  const observed = LANES.filter(lane => detections[lane].ambulance);
+  const priorityLane = engine.pendingAmbulanceLane || engine.ambulanceActiveLane;
+  let stage = 'NORMAL';
+  let message = systemState.mode === 'STATIC'
+    ? 'Fixed-time control: each lane receives a 30-second slot. Automatic ambulance priority is available in AI mode.'
+    : `${laneName(engine.activeLane)} is ${engine.phase.replace('_', ' ')}. GREEN allocation follows vehicle count (10-45s). Rotation skips empty lanes; longest-waiting overdue lanes receive priority.`;
+  if (systemState.mode === 'AI' && engine.pendingAmbulanceLane) {
+    stage = 'TRANSITION';
+    message = `Ambulance confirmed in ${laneName(priorityLane)}. ${laneName(engine.activeLane)} is YELLOW (${engine.timer}s remaining), then RED. ${laneName(priorityLane)} will turn GREEN next; other lanes stay RED.`;
+  } else if (systemState.mode === 'AI' && systemState.emergency) {
+    stage = 'PRIORITY';
+    message = `${laneName(priorityLane)} has GREEN ambulance priority. All other lanes are RED. GREEN is held without a countdown while ambulance detection is YES. When it changes to NO, a 3-second YELLOW transition leads back to normal scheduling.`;
+  } else if (systemState.mode === 'AI' && observed.length) {
+    stage = 'CONFIRMING';
+    message = `Ambulance detected in ${observed.map(laneName).join(', ')}. Waiting for controller confirmation before changing priority.`;
+  } else if (engine.phase === 'ALL_RED') {
+    message = 'No vehicles detected. All signals are RED while the controller waits for traffic.';
+  }
+  systemState.control = { stage, message, activeLane: engine.activeLane, priorityLane, phase: engine.phase, remaining: engine.timer };
+
   for (let l of LANES) {
     // Vehicle count is always sent for all lanes (even paused/RED ones)
-    systemState.lanes[l].vehicles = systemState.mode === 'STATIC' ? 0 : detections[l].vehicles;
+    systemState.lanes[l].vehicles = detections[l].vehicles;
+    systemState.lanes[l].ambulance = detections[l].ambulance === true;
     
     // Bounding boxes: only for the ACTIVE lane (GREEN/YELLOW) in AI mode
     // Paused (RED) lanes show vehicle count but no overlay boxes
@@ -315,14 +401,59 @@ app.get('/status', (req, res) => {
   res.json(systemState);
 });
 
+app.get('/reports/signal-decisions.csv', (req, res) => {
+  if (reportError) return res.status(503).json({ error: 'Decision history could not be fully saved.' });
+
+  try {
+    const entries = fs.readFileSync(reportHistory, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const rows = [
+      ['Timestamp (UTC)', 'Controller session (UTC)', 'Decision ID', 'Category', 'Mode', 'Weather',
+        'Active lane', 'Phase', 'Seconds remaining', ...LANES.map(lane => `${laneName(lane)} vehicles`), 'Decision'],
+      ...entries.map(entry => [
+        new Date(entry.timestamp).toISOString(), entry.sessionStarted, entry.id, entry.category,
+        entry.mode, entry.weather, entry.activeLane, entry.phase, entry.remainingSeconds,
+        ...LANES.map(lane => entry.vehicles[lane]), entry.message,
+      ]),
+    ];
+    const csv = rows.map(row => row.map(value => {
+      const text = String(value ?? '');
+      const safe = typeof value === 'string' && /^[\s\uFEFF]*[=+@-]|^[\t\r\n]/.test(text) ? "'" + text : text;
+      return '"' + safe.replace(/"/g, '""') + '"';
+    }).join(',')).join('\r\n');
+    res.attachment('signal-decisions.csv').type('text/csv').send(csv + '\r\n');
+  } catch (error) {
+    console.error('Could not export signal decisions:', error.message);
+    res.status(500).json({ error: 'Decision report unavailable.' });
+  }
+});
+
+app.get('/reports/signal-decisions.pdf', (req, res) => {
+  const pythonDir = path.resolve(__dirname, '../python');
+  const venvPython = path.join(pythonDir, 'venv', ...(process.platform === 'win32'
+    ? ['Scripts', 'python.exe'] : ['bin', 'python']));
+  const python = fs.existsSync(venvPython) ? venvPython : (process.platform === 'win32' ? 'python' : 'python3');
+  const csvUrl = `http://127.0.0.1:${server.address().port}/reports/signal-decisions.csv`;
+  execFile(python, [path.join(pythonDir, 'signal_report.py'), csvUrl], {
+    encoding: 'buffer', timeout: 30000, maxBuffer: 4 * 1024 * 1024, windowsHide: true,
+  }, (error, pdf, stderr) => {
+    if (error) {
+      console.error('Could not generate decision PDF:', stderr.toString() || error.message);
+      return res.status(500).json({ error: 'Decision PDF unavailable.' });
+    }
+    res.set('Cache-Control', 'no-store');
+    res.attachment('signal-decision-analysis.pdf').type('application/pdf').send(pdf);
+  });
+});
+
 app.post('/mode', (req, res) => {
   const { mode } = req.body;
   if (['AI', 'STATIC'].includes(mode)) {
+    const { activeLane, phase } = engine;
     systemState.mode = mode;
+    recordDecision('SYSTEM', `Control mode changed to ${mode}.`);
 
     systemState.emergency = false;
     engine.ambulanceActiveLane = null;
-    engine.ambulanceCapTimer = 0;
     engine.pendingAmbulanceLane = null;
 
     if (engine.phase === 'ALL_RED') {
@@ -331,10 +462,13 @@ app.post('/mode', (req, res) => {
       engine.activeLane = 'north';
     }
 
+    if (engine.timer === null) engine.timer = 30;
+
     if (mode === 'STATIC' && engine.timer > 30) {
       engine.timer = 30;
     }
 
+    recordSignalChange(activeLane, phase);
     res.json({ success: true, mode });
   } else {
     res.status(400).json({ error: 'Invalid mode' });
@@ -363,6 +497,15 @@ app.post('/detections', (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
+server.on('error', (error) => {
+  if (error.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is already in use. TrafficSense Node may already be running.`);
+    console.error(`Check http://localhost:${PORT}/status . Use the existing server or stop it before restarting.`);
+  } else {
+    console.error('Unable to start Node server:', error.message);
+  }
+  process.exit(1);
+});
 server.listen(PORT, () => {
   console.log(`Node Engine listening on port ${PORT}`);
 });

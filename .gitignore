@@ -1,0 +1,13 @@
+/Talaimari/
+/Vodra/
+/backend/python/uploads/
+/backend/python/video_sources.json
+/signal-decision-analysis.pdf
+node_modules/
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.log
+/traffic-system/public/north.mp4
+/traffic-system/public/west.mp4
